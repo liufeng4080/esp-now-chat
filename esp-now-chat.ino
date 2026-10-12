@@ -12,7 +12,8 @@ uint8_t broadcastAddress[] = {
   0xFF, 0xFF, 0xFF
 };
 
-String username = "Bob";
+String username = "Nobody";
+int currentChannel = 1;
 
 volatile bool beepPending = false;
 volatile bool redrawPending = false;
@@ -51,6 +52,27 @@ bool handleCommand(String cmd)
     else
     {
       addMessage("Usage: /user xxx");
+    }
+
+    return true;
+  }
+
+  if (cmd.startsWith("/channel "))
+  {
+    String arg = cmd.substring(9);
+    arg.trim();
+
+    int ch = arg.toInt();
+
+    if (ch >= 1 && ch <= 13)
+    {
+      currentChannel = ch;
+      esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+      addMessage("Channel -> " + String(currentChannel));
+    }
+    else
+    {
+      addMessage("Channel must be 1-13");
     }
 
     return true;
@@ -145,7 +167,7 @@ void setup()
 
   WiFi.mode(WIFI_STA);
 
-  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
 
   if (esp_now_init() != ESP_OK)
   {
@@ -163,13 +185,13 @@ void setup()
   esp_now_peer_info_t peerInfo = {};
 
   memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-  peerInfo.channel = 1;
+  peerInfo.channel = 0;      // 0 = 跟随当前 Wi-Fi 信道，切信道自动生效
   peerInfo.encrypt = false;
 
   esp_now_add_peer(&peerInfo);
 
   addMessage("ESP-NOW CHAT READY");
-  addMessage("CH:1  MAC:");
+  addMessage("CH:" + String(currentChannel) + "  MAC:");
   addMessage(WiFi.macAddress());
 
   redraw();
