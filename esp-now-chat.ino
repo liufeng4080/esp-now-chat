@@ -34,6 +34,32 @@ void addMessage(String msg)
   }
 }
 
+bool handleCommand(String cmd)
+{
+  cmd.trim();
+
+  if (cmd.startsWith("/user "))
+  {
+    String newName = cmd.substring(6);
+    newName.trim();
+
+    if (newName.length() > 0)
+    {
+      username = newName;
+      addMessage("Username -> " + username);
+    }
+    else
+    {
+      addMessage("Usage: /user xxx");
+    }
+
+    return true;
+  }
+
+  addMessage("Unknown cmd: " + cmd);
+  return true;
+}
+
 void redraw()
 {
   M5Cardputer.Display.fillScreen(BLACK);
@@ -119,7 +145,6 @@ void setup()
 
   WiFi.mode(WIFI_STA);
 
-  // 固定 Wi-Fi 信道，两台设备必须一致才能通信
   esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
 
   if (esp_now_init() != ESP_OK)
@@ -138,7 +163,7 @@ void setup()
   esp_now_peer_info_t peerInfo = {};
 
   memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-  peerInfo.channel = 1;      // 与上面设置的固定信道保持一致
+  peerInfo.channel = 1;
   peerInfo.encrypt = false;
 
   esp_now_add_peer(&peerInfo);
@@ -188,18 +213,25 @@ void loop()
     {
       if (inputLine.length() > 0)
       {
-        String packet =
-          username +
-          ": " +
-          inputLine;
+        if (inputLine.startsWith("/"))
+        {
+          handleCommand(inputLine);
+        }
+        else
+        {
+          String packet =
+            username +
+            ": " +
+            inputLine;
 
-        addMessage(packet);
+          addMessage(packet);
 
-        esp_now_send(
-          broadcastAddress,
-          (uint8_t*)packet.c_str(),
-          packet.length()
-        );
+          esp_now_send(
+            broadcastAddress,
+            (uint8_t*)packet.c_str(),
+            packet.length()
+          );
+        }
 
         inputLine = "";
       }
