@@ -1,6 +1,7 @@
 #include <M5Cardputer.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 
 String inputLine = "";
 String history[20];
@@ -12,6 +13,9 @@ uint8_t broadcastAddress[] = {
 };
 
 String username = "Bob";
+
+volatile bool beepPending = false;
+volatile bool redrawPending = false;
 
 void addMessage(String msg)
 {
@@ -91,7 +95,8 @@ void onDataRecv(
   }
 
   addMessage(msg);
-  redraw();
+  beepPending = true;
+  redrawPending = true;
 }
 
 void onDataSent(
@@ -110,7 +115,12 @@ void setup()
   M5Cardputer.Display.setRotation(1);
   M5Cardputer.Display.setTextSize(1);
 
+  M5Cardputer.Speaker.begin();
+
   WiFi.mode(WIFI_STA);
+
+  // 固定 Wi-Fi 信道，两台设备必须一致才能通信
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
 
   if (esp_now_init() != ESP_OK)
   {
@@ -128,13 +138,13 @@ void setup()
   esp_now_peer_info_t peerInfo = {};
 
   memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-  peerInfo.channel = 0;
+  peerInfo.channel = 1;      // 与上面设置的固定信道保持一致
   peerInfo.encrypt = false;
 
   esp_now_add_peer(&peerInfo);
 
   addMessage("ESP-NOW CHAT READY");
-  addMessage("MAC:");
+  addMessage("CH:1  MAC:");
   addMessage(WiFi.macAddress());
 
   redraw();
@@ -143,6 +153,18 @@ void setup()
 void loop()
 {
   M5Cardputer.update();
+
+  if (beepPending)
+  {
+    beepPending = false;
+    M5Cardputer.Speaker.tone(2000, 100);
+  }
+
+  if (redrawPending)
+  {
+    redrawPending = false;
+    redraw();
+  }
 
   if (M5Cardputer.Keyboard.isChange())
   {
