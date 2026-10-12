@@ -12,7 +12,7 @@ uint8_t broadcastAddress[] = {
   0xFF, 0xFF, 0xFF
 };
 
-String username = "Nobody";
+String username = "";
 int currentChannel = 1;
 
 volatile bool beepPending = false;
@@ -39,6 +39,13 @@ bool handleCommand(String cmd)
 {
   cmd.trim();
 
+  // --- /user ---
+  if (cmd == "/user")
+  {
+    addMessage("Username: " + username);
+    return true;
+  }
+
   if (cmd.startsWith("/user "))
   {
     String newName = cmd.substring(6);
@@ -54,6 +61,13 @@ bool handleCommand(String cmd)
       addMessage("Usage: /user xxx");
     }
 
+    return true;
+  }
+
+  // --- /channel ---
+  if (cmd == "/channel")
+  {
+    addMessage("Channel: " + String(currentChannel));
     return true;
   }
 
@@ -166,6 +180,21 @@ void setup()
   M5Cardputer.Speaker.begin();
 
   WiFi.mode(WIFI_STA);
+  delay(100);   // 等待 Wi-Fi 栈就绪
+
+  // 用 MAC 后四位初始化用户名，防止拿到全零 MAC
+  String mac = WiFi.macAddress();
+
+  int retry = 0;
+  while (mac == "00:00:00:00:00:00" && retry < 10)
+  {
+    delay(100);
+    mac = WiFi.macAddress();
+    retry++;
+  }
+
+  mac.replace(":", "");
+  username = "" + mac.substring(mac.length() - 4);
 
   esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
 
@@ -185,14 +214,14 @@ void setup()
   esp_now_peer_info_t peerInfo = {};
 
   memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-  peerInfo.channel = 0;      // 0 = 跟随当前 Wi-Fi 信道，切信道自动生效
+  peerInfo.channel = 0;
   peerInfo.encrypt = false;
 
   esp_now_add_peer(&peerInfo);
 
   addMessage("ESP-NOW CHAT READY");
-  addMessage("CH:" + String(currentChannel) + "  MAC:");
-  addMessage(WiFi.macAddress());
+  addMessage("CH:" + String(currentChannel));
+  addMessage("MAC:" + WiFi.macAddress());
 
   redraw();
 }
