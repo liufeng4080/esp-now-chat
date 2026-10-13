@@ -35,12 +35,35 @@ int16_t audioQueue[AUDIO_QUEUE_SIZE][FRAME_SAMPLES];
 volatile int audioQueueHead = 0;
 volatile int audioQueueTail = 0;
 
+// 编码帧队列：回调只入队原始 G722 帧，解码挪到主循环
+#define ENC_QUEUE_SIZE 16
+struct EncFrame
+{
+  uint8_t len;
+  uint8_t data[FRAME_BYTES];
+};
+EncFrame encQueue[ENC_QUEUE_SIZE];
+volatile int encQueueHead = 0;
+volatile int encQueueTail = 0;
+
+// 文本队列：回调只做定长拷贝，避免在回调中堆分配 String
+#define TEXT_QUEUE_SIZE 4
+#define TEXT_MAX_LEN 250
+struct TextFrame
+{
+  char data[TEXT_MAX_LEN + 1];
+};
+TextFrame textQueue[TEXT_QUEUE_SIZE];
+volatile int textQueueHead = 0;
+volatile int textQueueTail = 0;
+
 constexpr uint8_t PKT_TEXT = 0x01;
 constexpr uint8_t PKT_AUDIO = 0x02;
 
 volatile int txAudioCount = 0;
 volatile int rxAudioCount = 0;
 volatile int txFailCount = 0;
+volatile int rxDropCount = 0;
 volatile int txTextCount = 0;
 volatile int rxTextCount = 0;
 
@@ -59,6 +82,8 @@ int lastShownTxAudio = -1;
 int lastShownRxAudio = -1;
 int lastShownDecodePeak = -1;
 int lastShownPlayPeak = -1;
+int lastShownTxFail = -1;
+int lastShownRxDrop = -1;
 
 void addMessage(String msg)
 {
@@ -132,7 +157,8 @@ void updateCounters()
     0, baseY, M5Cardputer.Display.width(), 26, BLACK);
 
   M5Cardputer.Display.drawString(
-    "TXa:" + String(txAudioCount) + " RXa:" + String(rxAudioCount),
+    "TXa:" + String(txAudioCount) + " RXa:" + String(rxAudioCount) +
+      " fail:" + String(txFailCount) + " drop:" + String(rxDropCount),
     2, baseY + 12);
 
   M5Cardputer.Display.drawString(
@@ -197,14 +223,21 @@ void onDataRecv(
   if (pktType == PKT_TEXT)
   {
     rxTextCount++;
-    String msg = "";
-    for (int i = 1; i < len; i++)
+
+    // 只做定长拷贝入队，String/显示挪到主循环
+    int msgLen = len - 1;
+    if (msgLen > 0)
     {
-      msg += (char)incomingData[i];
+      if (msgLen > TEXT_MAX_LEN) msgLen = TEXT_MAX_LEN;
+
+      int nextHead = (textQueueHead + 1) % TEXT_QUEUE_SIZE;
+      if (nextHead != textQueueTail)
+      {
+        memcpy(textQueue[textQueueHead].data, &incomingData[1], msgLen);
+        textQueue[textQueueHead].data[msgLen] = '\0';
+        textQueueHead = nextHead;
+      }
     }
-    addMessage(msg);
-    beepPending = true;
-    redrawPending = true;
   }
   else if (pktType == PKT_AUDIO)
   {
@@ -215,30 +248,31 @@ void onDataRecv(
       int audioLen = len - 1;
       if (audioLen <= FRAME_BYTES)
       {
-        int nextHead = (audioQueueHead + 1) % AUDIO_QUEUE_SIZE;
-        if (nextHead != audioQueueTail)
+        // 只入队原始编码帧，解码挪到主循环
+        int nextHead = (encQueueHead + 1) % ENC_QUEUE_SIZE;
+        if (nextHead != encQueueTail)
         {
-          dec.decode((uint8_t*)&incomingData[1], audioLen,
-                     pcmBuf, FRAME_SAMPLES);
-
-          int16_t peak = 0;
-          for (int i = 0; i < FRAME_SAMPLES; i++)
-          {
-            int16_t v = pcmBuf[i];
-            if (v < 0) v = -v;
-            if (v > peak) peak = v;
-          }
-          decodePeak = peak;
-
-          memcpy(audioQueue[audioQueueHead], pcmBuf, sizeof(pcmBuf));
-          audioQueueHead = nextHead;
+          memcpy(encQueue[encQueueHead].data, &incomingData[1], audioLen);
+          encQueue[encQueueHead].len = audioLen;
+          encQueueHead = nextHead;
+        }
+        else
+        {
+          rxDropCount++;
         }
       }
     }
   }
 }
 
-void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {}
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
+{
+  // 以发送回调的最终状态为准（esp_now_send 返回 OK 只代表入队成功）
+  if (status != ESP_NOW_SEND_SUCCESS)
+  {
+    txFailCount++;
+  }
+}
 
 void setup()
 {
@@ -297,6 +331,15 @@ void loop()
 {
   M5Cardputer.update();
 
+  // 处理收到的文本（主循环中入历史，避免在回调里堆分配）
+  if (textQueueTail != textQueueHead)
+  {
+    addMessage(String(textQueue[textQueueTail].data));
+    textQueueTail = (textQueueTail + 1) % TEXT_QUEUE_SIZE;
+    beepPending = true;
+    redrawPending = true;
+  }
+
   if (beepPending)
   {
     beepPending = false;
@@ -307,6 +350,37 @@ void loop()
   {
     redrawPending = false;
     redraw();
+  }
+
+  // --- 主循环解码收到的编码帧（原在回调中做，现移出） ---
+  if (!pttActive && encQueueTail != encQueueHead)
+  {
+    EncFrame &f = encQueue[encQueueTail];
+
+    int nextHead = (audioQueueHead + 1) % AUDIO_QUEUE_SIZE;
+    if (nextHead != audioQueueTail)
+    {
+      dec.decode(f.data, f.len, audioQueue[audioQueueHead], FRAME_SAMPLES);
+
+      int16_t peak = 0;
+      const int16_t *p = audioQueue[audioQueueHead];
+      for (int i = 0; i < FRAME_SAMPLES; i++)
+      {
+        int16_t v = p[i];
+        if (v < 0) v = -v;
+        if (v > peak) peak = v;
+      }
+      decodePeak = peak;
+
+      audioQueueHead = nextHead;
+    }
+    else
+    {
+      // 播放队列满，丢弃本帧
+      rxDropCount++;
+    }
+
+    encQueueTail = (encQueueTail + 1) % ENC_QUEUE_SIZE;
   }
 
   // --- 20ms 定时播放，与 loop() 循环速度解耦 ---
@@ -338,13 +412,17 @@ void loop()
     if (txAudioCount != lastShownTxAudio ||
         rxAudioCount != lastShownRxAudio ||
         decodePeak != lastShownDecodePeak ||
-        playPeak != lastShownPlayPeak)
+        playPeak != lastShownPlayPeak ||
+        txFailCount != lastShownTxFail ||
+        rxDropCount != lastShownRxDrop)
     {
       updateCounters();
       lastShownTxAudio = txAudioCount;
       lastShownRxAudio = rxAudioCount;
       lastShownDecodePeak = decodePeak;
       lastShownPlayPeak = playPeak;
+      lastShownTxFail = txFailCount;
+      lastShownRxDrop = rxDropCount;
     }
   }
 
@@ -356,6 +434,9 @@ void loop()
   if (tabNow && !pttActive)
   {
     pttActive = true;
+    // 清空接收队列，避免松开 PTT 后播放过期的旧音频
+    encQueueTail = encQueueHead;
+    audioQueueTail = audioQueueHead;
     M5Cardputer.Speaker.end();
     delay(10);
     M5Cardputer.Mic.begin();
@@ -377,6 +458,9 @@ void loop()
   {
     if (millis() - lastAudioSendTime >= 20)
     {
+      // 统一节流：record 失败时也不会全速空转重试
+      lastAudioSendTime = millis();
+
       if (M5Cardputer.Mic.record(pcmBuf, FRAME_SAMPLES, 16000))
       {
         constexpr int GAIN_MULTIPLIER = 10;
@@ -398,11 +482,7 @@ void loop()
 
         constexpr int VAD_THRESHOLD = 500;
 
-        if (peak < VAD_THRESHOLD)
-        {
-          lastAudioSendTime = millis();
-        }
-        else
+        if (peak >= VAD_THRESHOLD)
         {
           int encodedLen = enc.encode(pcmBuf, FRAME_SAMPLES, encodedBuf, FRAME_BYTES);
 
@@ -414,9 +494,7 @@ void loop()
             packet[0] = PKT_AUDIO;
             memcpy(&packet[1], encodedBuf, encodedLen);
 
-            esp_err_t result = esp_now_send(broadcastAddress, packet, encodedLen + 1);
-
-            if (result == ESP_OK)
+            if (esp_now_send(broadcastAddress, packet, encodedLen + 1) == ESP_OK)
             {
               txAudioCount++;
             }
@@ -424,8 +502,6 @@ void loop()
             {
               txFailCount++;
             }
-
-            lastAudioSendTime = millis();
           }
         }
       }
@@ -458,15 +534,29 @@ void loop()
         else
         {
           String packet = username + ": " + inputLine;
-          addMessage(packet);
 
-          String payload = String((char)PKT_TEXT) + packet;
-          esp_now_send(
-            broadcastAddress,
-            (uint8_t*)payload.c_str(),
-            payload.length()
-          );
-          txTextCount++;
+          // ESP-NOW 单包上限 250 字节（含 1 字节类型前缀）
+          if (packet.length() + 1 > 250)
+          {
+            addMessage("Too long: " + String(packet.length()) + "B (max 249)");
+          }
+          else
+          {
+            addMessage(packet);
+
+            String payload = String((char)PKT_TEXT) + packet;
+            if (esp_now_send(
+                  broadcastAddress,
+                  (uint8_t *)payload.c_str(),
+                  payload.length()) == ESP_OK)
+            {
+              txTextCount++;
+            }
+            else
+            {
+              txFailCount++;
+            }
+          }
         }
         inputLine = "";
       }
