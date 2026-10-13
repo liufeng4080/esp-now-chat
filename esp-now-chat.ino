@@ -40,6 +40,7 @@ volatile int audioQueueTail = 0;
 struct EncFrame
 {
   uint8_t len;
+  uint8_t seq;
   uint8_t data[FRAME_BYTES];
 };
 EncFrame encQueue[ENC_QUEUE_SIZE];
@@ -71,19 +72,37 @@ volatile int decodePeak = 0;
 volatile int playPeak = 0;
 volatile int lastEncodedLen = 0;
 
-unsigned long lastAudioSendTime = 0;
-
-// --- 播放节奏控制 ---
-unsigned long lastPlayTime = 0;
+// --- 播放节奏控制（累积节拍：loop 卡顿后自动追赶，不累积永久延迟） ---
+unsigned long nextPlayTime = 0;
 constexpr int PLAY_INTERVAL_MS = 20;
 
-unsigned long lastCounterUpdateTime = 0;
-int lastShownTxAudio = -1;
-int lastShownRxAudio = -1;
-int lastShownDecodePeak = -1;
-int lastShownPlayPeak = -1;
-int lastShownTxFail = -1;
-int lastShownRxDrop = -1;
+// --- VAD 挂起：语音结束后继续发 N 帧（20ms/帧），避免句尾被切 ---
+constexpr int VAD_HANGOVER_FRAMES = 15; // 300ms
+int hangoverFrames = 0;
+uint8_t txSeq = 0;
+
+// --- 接收侧丢帧补偿（PLC）：丢包时重复上一帧 ---
+constexpr int MAX_PLC_FRAMES = 2;
+uint8_t lastRxSeq = 0;
+bool haveLastRxSeq = false;
+int16_t lastDecoded[FRAME_SAMPLES];
+
+// --- 显示双缓冲画布，消除整屏重绘闪烁 ---
+M5Canvas canvas(&M5Cardputer.Display);
+
+// 播放队列入队（满则丢弃并计数）
+bool pushPcmFrame(const int16_t *src)
+{
+  int nextHead = (audioQueueHead + 1) % AUDIO_QUEUE_SIZE;
+  if (nextHead == audioQueueTail)
+  {
+    rxDropCount++;
+    return false;
+  }
+  memcpy(audioQueue[audioQueueHead], src, FRAME_SAMPLES * sizeof(int16_t));
+  audioQueueHead = nextHead;
+  return true;
+}
 
 void addMessage(String msg)
 {
@@ -149,29 +168,13 @@ bool handleCommand(String cmd)
   return true;
 }
 
-void updateCounters()
-{
-  int baseY = M5Cardputer.Display.height() - 40;
-
-  M5Cardputer.Display.fillRect(
-    0, baseY, M5Cardputer.Display.width(), 26, BLACK);
-
-  M5Cardputer.Display.drawString(
-    "TXa:" + String(txAudioCount) + " RXa:" + String(rxAudioCount) +
-      " fail:" + String(txFailCount) + " drop:" + String(rxDropCount),
-    2, baseY + 12);
-
-  M5Cardputer.Display.drawString(
-    "decPk:" + String(decodePeak) + " playPk:" + String(playPeak),
-    2, baseY);
-}
-
 void redraw()
 {
-  M5Cardputer.Display.fillScreen(BLACK);
+  // 所有绘制先在 canvas 完成，最后一次 pushSprite 上屏，消除闪烁
+  canvas.fillScreen(BLACK);
 
   const int lineHeight = 10;
-  int maxVisible = (M5Cardputer.Display.height() - 42) / lineHeight;
+  int maxVisible = (canvas.height() - 16) / lineHeight;
   int startIndex = 0;
 
   if (historyCount > maxVisible)
@@ -182,33 +185,47 @@ void redraw()
   int y = 2;
   for (int i = startIndex; i < historyCount; i++)
   {
-    M5Cardputer.Display.drawString(history[i], 2, y);
+    canvas.drawString(history[i], 2, y);
     y += lineHeight;
   }
 
-  M5Cardputer.Display.fillRect(
-    0, M5Cardputer.Display.height() - 14,
-    M5Cardputer.Display.width(), 14, DARKGREY);
+  canvas.fillRect(
+    0, canvas.height() - 14,
+    canvas.width(), 14, DARKGREY);
 
-  M5Cardputer.Display.drawString(
-    ">" + inputLine, 2, M5Cardputer.Display.height() - 12);
+  canvas.drawString(
+    ">" + inputLine, 2, canvas.height() - 12);
 
   if (pttActive)
   {
-    M5Cardputer.Display.fillRect(
-      M5Cardputer.Display.width() - 40, 2, 38, 12, RED);
-    M5Cardputer.Display.drawString(
-      "TX", M5Cardputer.Display.width() - 34, 3);
+    canvas.fillRect(
+      canvas.width() - 40, 2, 38, 12, RED);
+    canvas.setTextColor(WHITE);
+    canvas.drawString("TX", canvas.width() - 34, 3);
   }
   else
   {
-    M5Cardputer.Display.fillRect(
-      M5Cardputer.Display.width() - 40, 2, 38, 12, DARKGREEN);
-    M5Cardputer.Display.drawString(
-      "RX", M5Cardputer.Display.width() - 34, 3);
+    canvas.fillRect(
+      canvas.width() - 40, 2, 38, 12, DARKGREEN);
+    canvas.setTextColor(WHITE);
+    canvas.drawString("RX", canvas.width() - 34, 3);
   }
+  canvas.setTextColor(GREEN);
 
-  updateCounters();
+  canvas.pushSprite(0, 0);
+}
+
+// 麦克风双缓冲：一块填满后在回调里立即提交另一块，采集无间隙
+// （record() 只是向持续运行的采集任务提交缓冲，不排队就会丢采样）
+int16_t micBuf[2][FRAME_SAMPLES];
+volatile int micReady = -1; // -1=无就绪帧；0/1=micBuf 下标待处理
+
+void micBufferRelease(void *args, void *data, size_t length)
+{
+  int idx = (data == (void *)micBuf[0]) ? 0 : 1;
+  // 回调内提交另一块缓冲（官方支持的用法），消除采集间隙
+  M5Cardputer.Mic.record(micBuf[idx ^ 1], FRAME_SAMPLES, 16000);
+  micReady = idx;
 }
 
 void onDataRecv(
@@ -243,17 +260,19 @@ void onDataRecv(
   {
     rxAudioCount++;
 
-    if (!pttActive && len > 1)
+    // 包格式：[类型][序号][G722帧]
+    if (!pttActive && len > 2)
     {
-      int audioLen = len - 1;
+      int audioLen = len - 2;
       if (audioLen <= FRAME_BYTES)
       {
         // 只入队原始编码帧，解码挪到主循环
         int nextHead = (encQueueHead + 1) % ENC_QUEUE_SIZE;
         if (nextHead != encQueueTail)
         {
-          memcpy(encQueue[encQueueHead].data, &incomingData[1], audioLen);
+          memcpy(encQueue[encQueueHead].data, &incomingData[2], audioLen);
           encQueue[encQueueHead].len = audioLen;
+          encQueue[encQueueHead].seq = incomingData[1];
           encQueueHead = nextHead;
         }
         else
@@ -282,7 +301,18 @@ void setup()
   M5Cardputer.Display.setRotation(1);
   M5Cardputer.Display.setTextSize(1);
 
+  // 显示双缓冲画布（全屏 16bit），默认绿色字体
+  canvas.setColorDepth(16);
+  canvas.createSprite(
+    M5Cardputer.Display.width(), M5Cardputer.Display.height());
+  canvas.setTextColor(GREEN);
+
   M5Cardputer.Speaker.begin();
+  // 默认音量仅 64/255，拉满改善声音小
+  M5Cardputer.Speaker.setVolume(255);
+
+  // 注册麦克风缓冲释放回调（须在首次 record 之前设置）
+  M5Cardputer.Mic.setBufferReleaseCallback(nullptr, micBufferRelease);
 
   enc.begin({16000, 1, 16});
   dec.begin({16000, 1, 16});
@@ -352,77 +382,80 @@ void loop()
     redraw();
   }
 
-  // --- 主循环解码收到的编码帧（原在回调中做，现移出） ---
+  // --- 主循环解码收到的编码帧，含丢帧补偿（PLC） ---
   if (!pttActive && encQueueTail != encQueueHead)
   {
     EncFrame &f = encQueue[encQueueTail];
 
-    int nextHead = (audioQueueHead + 1) % AUDIO_QUEUE_SIZE;
-    if (nextHead != audioQueueTail)
+    // 序号出现间隙说明中间丢包，用上一帧重复补偿（限制帧数防机械感）
+    if (haveLastRxSeq)
     {
-      dec.decode(f.data, f.len, audioQueue[audioQueueHead], FRAME_SAMPLES);
+      uint8_t gap = (uint8_t)(f.seq - lastRxSeq - 1);
+      if (gap > 0 && gap <= 100)
+      {
+        int plc = (gap < MAX_PLC_FRAMES) ? gap : MAX_PLC_FRAMES;
+        for (int k = 0; k < plc; k++)
+        {
+          pushPcmFrame(lastDecoded);
+        }
+      }
+    }
 
-      int16_t peak = 0;
-      const int16_t *p = audioQueue[audioQueueHead];
+    dec.decode(f.data, f.len, lastDecoded, FRAME_SAMPLES);
+
+    int16_t peak = 0;
+    for (int i = 0; i < FRAME_SAMPLES; i++)
+    {
+      int16_t v = lastDecoded[i];
+      if (v < 0) v = -v;
+      if (v > peak) peak = v;
+    }
+    decodePeak = peak;
+
+    // 轻量向下扩张：峰值低于阈值时按比例衰减，压低句间底噪（语音帧不受影响）
+    constexpr int EXPAND_THRESH = 1000;
+    if (peak > 0 && peak < EXPAND_THRESH)
+    {
+      int32_t factor = ((int32_t)peak << 8) / EXPAND_THRESH;
       for (int i = 0; i < FRAME_SAMPLES; i++)
       {
-        int16_t v = p[i];
-        if (v < 0) v = -v;
-        if (v > peak) peak = v;
+        lastDecoded[i] = (int16_t)(((int32_t)lastDecoded[i] * factor) >> 8);
       }
-      decodePeak = peak;
-
-      audioQueueHead = nextHead;
-    }
-    else
-    {
-      // 播放队列满，丢弃本帧
-      rxDropCount++;
     }
 
+    pushPcmFrame(lastDecoded);
+
+    haveLastRxSeq = true;
+    lastRxSeq = f.seq;
     encQueueTail = (encQueueTail + 1) % ENC_QUEUE_SIZE;
   }
 
-  // --- 20ms 定时播放，与 loop() 循环速度解耦 ---
+  // --- 播放节拍：playRaw 为非阻塞入队，用累积计时控制节奏 ---
+  // loop 卡顿落后时自动加速追赶，不累积永久延迟；落后过多则对齐防突发
   if (!pttActive && audioQueueTail != audioQueueHead)
   {
-    if (millis() - lastPlayTime >= PLAY_INTERVAL_MS)
+    unsigned long now = millis();
+    if ((long)(now - nextPlayTime) >= 0)
     {
-      lastPlayTime = millis();
+      if (now - nextPlayTime > 200) nextPlayTime = now;
+      nextPlayTime += PLAY_INTERVAL_MS;
 
       int16_t pp = 0;
+      const int16_t *p = audioQueue[audioQueueTail];
       for (int i = 0; i < FRAME_SAMPLES; i++)
       {
-        int16_t v = audioQueue[audioQueueTail][i];
+        int16_t v = p[i];
         if (v < 0) v = -v;
         if (v > pp) pp = v;
       }
       playPeak = pp;
 
-      M5Cardputer.Speaker.playRaw(
-        audioQueue[audioQueueTail], FRAME_SAMPLES, 16000, false, 1, 0);
-
-      audioQueueTail = (audioQueueTail + 1) % AUDIO_QUEUE_SIZE;
-    }
-  }
-
-  if (millis() - lastCounterUpdateTime > 200)
-  {
-    lastCounterUpdateTime = millis();
-    if (txAudioCount != lastShownTxAudio ||
-        rxAudioCount != lastShownRxAudio ||
-        decodePeak != lastShownDecodePeak ||
-        playPeak != lastShownPlayPeak ||
-        txFailCount != lastShownTxFail ||
-        rxDropCount != lastShownRxDrop)
-    {
-      updateCounters();
-      lastShownTxAudio = txAudioCount;
-      lastShownRxAudio = rxAudioCount;
-      lastShownDecodePeak = decodePeak;
-      lastShownPlayPeak = playPeak;
-      lastShownTxFail = txFailCount;
-      lastShownRxDrop = rxDropCount;
+      // playRaw 返回 false 表示内部缓冲满，保留该帧下轮重试
+      if (M5Cardputer.Speaker.playRaw(
+            audioQueue[audioQueueTail], FRAME_SAMPLES, 16000, false, 1, 0))
+      {
+        audioQueueTail = (audioQueueTail + 1) % AUDIO_QUEUE_SIZE;
+      }
     }
   }
 
@@ -437,10 +470,15 @@ void loop()
     // 清空接收队列，避免松开 PTT 后播放过期的旧音频
     encQueueTail = encQueueHead;
     audioQueueTail = audioQueueHead;
+    haveLastRxSeq = false;
+    hangoverFrames = 0;
+    nextPlayTime = millis();
     M5Cardputer.Speaker.end();
     delay(10);
     M5Cardputer.Mic.begin();
-    lastAudioSendTime = millis();
+    // 提交首块缓冲，此后由释放回调自动交替提交，采集无缝
+    micReady = -1;
+    M5Cardputer.Mic.record(micBuf[0], FRAME_SAMPLES, 16000);
     redraw();
   }
 
@@ -453,55 +491,77 @@ void loop()
     redraw();
   }
 
-  // PTT 发送中：采集 → 放大 → VAD → 编码 → 发送
+  // PTT 发送中：采集由回调双缓冲驱动，这里只处理就绪帧
+  // 流程：取帧 → 放大 → VAD 挂起 → 编码 → 发送
   if (pttActive)
   {
-    if (millis() - lastAudioSendTime >= 20)
+    int ready = micReady;
+    if (ready >= 0)
     {
-      // 统一节流：record 失败时也不会全速空转重试
-      lastAudioSendTime = millis();
+      micReady = -1;
+      // 拷出处理，采集任务同时填充另一块
+      memcpy(pcmBuf, micBuf[ready], sizeof(pcmBuf));
 
-      if (M5Cardputer.Mic.record(pcmBuf, FRAME_SAMPLES, 16000))
+      // 增益 ×10 + 软限幅：超过限幅点后压缩增益，避免硬削波发劈
+      constexpr int GAIN_MULTIPLIER = 10;
+      constexpr int SOFT_LIMIT = 24000;
+      for (int i = 0; i < FRAME_SAMPLES; i++)
       {
-        constexpr int GAIN_MULTIPLIER = 10;
-        for (int i = 0; i < FRAME_SAMPLES; i++)
+        int32_t v = (int32_t)pcmBuf[i] * GAIN_MULTIPLIER;
+        if (v > SOFT_LIMIT)
         {
-          int32_t v = (int32_t)pcmBuf[i] * GAIN_MULTIPLIER;
+          v = SOFT_LIMIT + (v - SOFT_LIMIT) / 8;
           if (v > 32767) v = 32767;
+        }
+        else if (v < -SOFT_LIMIT)
+        {
+          v = -SOFT_LIMIT + (v + SOFT_LIMIT) / 8;
           if (v < -32768) v = -32768;
-          pcmBuf[i] = (int16_t)v;
         }
+        pcmBuf[i] = (int16_t)v;
+      }
 
-        int16_t peak = 0;
-        for (int i = 0; i < FRAME_SAMPLES; i++)
+      int16_t peak = 0;
+      for (int i = 0; i < FRAME_SAMPLES; i++)
+      {
+        int16_t v = pcmBuf[i];
+        if (v < 0) v = -v;
+        if (v > peak) peak = v;
+      }
+
+      constexpr int VAD_THRESHOLD = 500;
+
+      // VAD 挂起：检测到语音则重置挂起计数，静音期继续发送挂起帧
+      if (peak >= VAD_THRESHOLD)
+      {
+        hangoverFrames = VAD_HANGOVER_FRAMES;
+      }
+      else if (hangoverFrames > 0)
+      {
+        hangoverFrames--;
+      }
+
+      if (peak >= VAD_THRESHOLD || hangoverFrames > 0)
+      {
+        int encodedLen = enc.encode(pcmBuf, FRAME_SAMPLES, encodedBuf, FRAME_BYTES);
+
+        if (encodedLen > 0)
         {
-          int16_t v = pcmBuf[i];
-          if (v < 0) v = -v;
-          if (v > peak) peak = v;
-        }
+          lastEncodedLen = encodedLen;
 
-        constexpr int VAD_THRESHOLD = 500;
+          // 包格式：[类型][序号][G722帧]，序号供接收端丢帧补偿
+          uint8_t packet[FRAME_BYTES + 2];
+          packet[0] = PKT_AUDIO;
+          packet[1] = txSeq++;
+          memcpy(&packet[2], encodedBuf, encodedLen);
 
-        if (peak >= VAD_THRESHOLD)
-        {
-          int encodedLen = enc.encode(pcmBuf, FRAME_SAMPLES, encodedBuf, FRAME_BYTES);
-
-          if (encodedLen > 0)
+          if (esp_now_send(broadcastAddress, packet, encodedLen + 2) == ESP_OK)
           {
-            lastEncodedLen = encodedLen;
-
-            uint8_t packet[FRAME_BYTES + 1];
-            packet[0] = PKT_AUDIO;
-            memcpy(&packet[1], encodedBuf, encodedLen);
-
-            if (esp_now_send(broadcastAddress, packet, encodedLen + 1) == ESP_OK)
-            {
-              txAudioCount++;
-            }
-            else
-            {
-              txFailCount++;
-            }
+            txAudioCount++;
+          }
+          else
+          {
+            txFailCount++;
           }
         }
       }
